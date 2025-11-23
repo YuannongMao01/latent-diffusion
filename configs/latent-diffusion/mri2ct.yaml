@@ -1,0 +1,127 @@
+model:
+  # Conservative LR for Apple M-series; bump if you have headroom.
+  base_learning_rate: 1.0e-4
+  target: ldm.models.diffusion.ddpm.LatentDiffusion
+  params:
+    linear_start: 0.0015
+    linear_end: 0.012
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    loss_type: l1
+    first_stage_key: target
+    cond_stage_key: source
+    conditioning_key: concat
+    concat_mode: true
+    image_size: 216  # matches latent width when resizing to 864x576 (downsampled by f=4)
+    channels: 4
+    cond_stage_trainable: false
+    monitor: val/loss_simple_ema
+
+    scheduler_config:
+      target: ldm.lr_scheduler.LambdaLinearScheduler
+      params:
+        warm_up_steps: [1000]
+        cycle_lengths: [10000000000000]
+        f_start: [1.0e-6]
+        f_max: [1.0]
+        f_min: [1.0]
+
+    # Diffusion UNet operating in latent space.
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+      params:
+        image_size: 216
+        in_channels: 8        # latent (4) + conditioning latent (4)
+        out_channels: 4
+        model_channels: 192
+        attention_resolutions: [8, 4, 2]
+        num_res_blocks: 2
+        channel_mult: [1, 2, 4, 4]
+        num_head_channels: 32
+        use_scale_shift_norm: true
+        resblock_updown: true
+
+    # Frozen autoencoder for targets (shared ckpt with conditioning branch).
+    first_stage_config:
+      target: ldm.models.autoencoder.AutoencoderKL
+      params:
+        embed_dim: 4
+        monitor: val/rec_loss
+        ckpt_path: models/first_stage_models/kl-f4/model.ckpt
+        ddconfig:
+          double_z: true
+          z_channels: 4
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult: [1, 2, 4, 4]
+          num_res_blocks: 2
+          attn_resolutions: []
+          dropout: 0.0
+        lossconfig:
+          target: torch.nn.Identity
+
+    # Encode the MRI conditioning image with the same frozen autoencoder.
+    cond_stage_config:
+      target: ldm.models.autoencoder.AutoencoderKL
+      params:
+        embed_dim: 4
+        monitor: val/rec_loss
+        ckpt_path: models/first_stage_models/kl-f4/model.ckpt
+        ddconfig:
+          double_z: true
+          z_channels: 4
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult: [1, 2, 4, 4]
+          num_res_blocks: 2
+          attn_resolutions: []
+          dropout: 0.0
+        lossconfig:
+          target: torch.nn.Identity
+
+
+# Data module using the paired PNGs; adjust paths for your dataset.
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 1            # Start small for Apple M4 / MPS
+    num_workers: 2           # Increase if you have CPU headroom
+    wrap: false
+    train:
+      target: ldm.data.paired_image.PairedImageDataset
+      params:
+        source_dir: /path/to/data/train/src
+        target_dir: /path/to/data/train/tgt
+        size: [576, 864]     # nearest multiple-of-32 to 560x840; keeps aspect ratio
+        interpolation: bicubic
+        flip_p: 0.5
+    validation:
+      target: ldm.data.paired_image.PairedImageDataset
+      params:
+        source_dir: /path/to/data/val/src
+        target_dir: /path/to/data/val/tgt
+        size: [576, 864]
+        interpolation: bicubic
+        flip_p: 0.0
+
+lightning:
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        batch_frequency: 1000
+        max_images: 4
+        increase_log_steps: false
+
+  trainer:
+    benchmark: true
+    max_epochs: 100
+    accelerator: auto   # Works on Apple M-series (MPS) or CPU
+    devices: 1
+    precision: 32
+    accumulate_grad_batches: 2  # effective batch size 2 without extra memory
