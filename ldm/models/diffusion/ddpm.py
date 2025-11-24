@@ -461,7 +461,11 @@ class LatentDiffusion(DDPM):
         self.instantiate_cond_stage(cond_stage_config)
         self.cond_stage_forward = cond_stage_forward
         self.clip_denoised = False
-        self.bbox_tokenizer = None  
+        self.bbox_tokenizer = None
+
+        # Debug flags to avoid excessive logging while validating concat conditioning.
+        self._concat_debug_logged = False
+        self._encode_debug_logged = False
 
         self.restarted_from_ckpt = False
         if ckpt_path is not None:
@@ -560,6 +564,11 @@ class LatentDiffusion(DDPM):
             assert hasattr(self.cond_stage_model, self.cond_stage_forward)
             c = getattr(self.cond_stage_model, self.cond_stage_forward)(c)
         return c
+
+    def _encode_conditional_image(self, image):
+        encoder_posterior = self.cond_stage_model.encode(image.to(self.device))
+        cond = self.get_first_stage_encoding(encoder_posterior).detach()
+        return cond
 
     def meshgrid(self, h, w):
         y = torch.arange(0, h).view(h, 1, 1).repeat(1, w, 1)
@@ -660,6 +669,16 @@ class LatentDiffusion(DDPM):
         encoder_posterior = self.encode_first_stage(x)
         z = self.get_first_stage_encoding(encoder_posterior).detach()
 
+        if not self._encode_debug_logged:
+            with torch.no_grad():
+                try:
+                    z_dbg = self.first_stage_model.encode(x).sample()
+                    z_shape = tuple(z_dbg.shape)
+                except Exception as exc:
+                    print(f"[debug] first_stage encode failed: {exc}")
+                    z_shape = None
+                self._encode_debug_logged = True if z_shape is not None else False
+
         if self.model.conditioning_key is not None:
             if cond_key is None:
                 cond_key = self.cond_stage_key
@@ -673,8 +692,17 @@ class LatentDiffusion(DDPM):
             else:
                 xc = x
             if not self.cond_stage_trainable or force_c_encode:
-                if isinstance(xc, dict) or isinstance(xc, list):
-                    # import pudb; pudb.set_trace()
+                if isinstance(self.cond_stage_model, AutoencoderKL):
+                    c = self._encode_conditional_image(xc)
+                    if not self._encode_debug_logged:
+                        with torch.no_grad():
+                            try:
+                                cond_dbg = self.cond_stage_model.encode(xc.to(self.device)).sample()
+                                print(f"[debug] first/cond encode shapes: z={z_shape}, cond={tuple(cond_dbg.shape)}")
+                                self._encode_debug_logged = True
+                            except Exception as exc:
+                                print(f"[debug] cond_stage encode failed: {exc}")
+                elif isinstance(xc, dict) or isinstance(xc, list):
                     c = self.get_learned_conditioning(xc)
                 else:
                     c = self.get_learned_conditioning(xc.to(self.device))
@@ -890,18 +918,35 @@ class LatentDiffusion(DDPM):
 
     def apply_model(self, x_noisy, t, cond, return_ids=False):
 
-        if isinstance(cond, dict):
-            # hybrid case, cond is exptected to be a dict
-            pass
+        cond_dict = None
+        cond_tensor = None
+        if cond is None:
+            cond_dict = None
+            cond_tensor = None
+        elif isinstance(cond, dict):
+            cond_dict = cond
+        elif self.model.conditioning_key == 'concat':
+            cond_tensor = cond
         else:
             if not isinstance(cond, list):
                 cond = [cond]
             key = 'c_concat' if self.model.conditioning_key == 'concat' else 'c_crossattn'
-            cond = {key: cond}
+            cond_dict = {key: cond}
+
+        if not self._concat_debug_logged and cond_tensor is not None:
+            try:
+                print(f"noisy: {tuple(x_noisy.shape)}")
+                print(f"cond: {tuple(cond_tensor.shape)}")
+                x_in = torch.cat([x_noisy, cond_tensor], dim=1)
+                print(f"concat: {tuple(x_in.shape)}")
+            except Exception as exc:
+                print(f"concat debug failed: {exc}")
+            self._concat_debug_logged = True
 
         if hasattr(self, "split_input_params"):
-            assert len(cond) == 1  # todo can only deal with one conditioning atm
-            assert not return_ids  
+            cond_source = cond_dict if cond_dict is not None else {'c_concat': [cond_tensor]} if cond_tensor is not None else {}
+            assert len(cond_source) == 1 or len(cond_source) == 0  # todo can only deal with one conditioning atm
+            assert not return_ids
             ks = self.split_input_params["ks"]  # eg. (128, 128)
             stride = self.split_input_params["stride"]  # eg. (64, 64)
 
@@ -914,10 +959,10 @@ class LatentDiffusion(DDPM):
             z = z.view((z.shape[0], -1, ks[0], ks[1], z.shape[-1]))  # (bn, nc, ks[0], ks[1], L )
             z_list = [z[:, :, :, :, i] for i in range(z.shape[-1])]
 
-            if self.cond_stage_key in ["image", "LR_image", "segmentation",
+            if cond_source and self.cond_stage_key in ["image", "LR_image", "segmentation",
                                        'bbox_img'] and self.model.conditioning_key:  # todo check for completeness
-                c_key = next(iter(cond.keys()))  # get key
-                c = next(iter(cond.values()))  # get value
+                c_key = next(iter(cond_source.keys()))  # get key
+                c = next(iter(cond_source.values()))  # get value
                 assert (len(c) == 1)  # todo extend to list with more than one elem
                 c = c[0]  # get element
 
@@ -969,10 +1014,18 @@ class LatentDiffusion(DDPM):
                 cond_list = [{'c_crossattn': [e]} for e in adapted_cond]
 
             else:
-                cond_list = [cond for i in range(z.shape[-1])]  # Todo make this more efficient
+                cond_list = []
+                for _ in range(z.shape[-1]):
+                    cond_list.append(cond_tensor)
 
             # apply model by loop over crops
-            output_list = [self.model(z_list[i], t, **cond_list[i]) for i in range(z.shape[-1])]
+            output_list = []
+            for i in range(z.shape[-1]):
+                current_cond = cond_list[i]
+                if isinstance(current_cond, dict):
+                    output_list.append(self.model(z_list[i], t, **current_cond))
+                else:
+                    output_list.append(self.model(z_list[i], t, cond=current_cond))
             assert not isinstance(output_list[0],
                                   tuple)  # todo cant deal with multiple model outputs check this never happens
 
@@ -984,7 +1037,10 @@ class LatentDiffusion(DDPM):
             x_recon = fold(o) / normalization
 
         else:
-            x_recon = self.model(x_noisy, t, **cond)
+            if cond_dict is not None:
+                x_recon = self.model(x_noisy, t, **cond_dict)
+            else:
+                x_recon = self.model(x_noisy, t, cond=cond_tensor)
 
         if isinstance(x_recon, tuple) and not return_ids:
             return x_recon[0]
@@ -1399,8 +1455,10 @@ class DiffusionWrapper(pl.LightningModule):
         self.conditioning_key = conditioning_key
         assert self.conditioning_key in [None, 'concat', 'crossattn', 'hybrid', 'adm']
 
-    def forward(self, x, t, c_concat: list = None, c_crossattn: list = None):
-        if self.conditioning_key is None:
+    def forward(self, x, t, c_concat: list = None, c_crossattn: list = None, cond=None):
+        if cond is not None:
+            out = self.diffusion_model(x, t, cond=cond)
+        elif self.conditioning_key is None:
             out = self.diffusion_model(x, t)
         elif self.conditioning_key == 'concat':
             xc = torch.cat([x] + c_concat, dim=1)

@@ -41,6 +41,9 @@ conda env create -f environment.yaml
 conda activate ldm
 ```
 
+## Image-to-image fine-tuning quick start
+If you want to train diffusion weights for paired image translation (e.g., MRI→CT projections) while keeping the autoencoder frozen, see [docs/paired_image_training.md](docs/paired_image_training.md) for a step-by-step guide using the `PairedImageDataset` loader.
+
 # Pretrained Models
 A general list of all available checkpoints is available in via our [model zoo](#model-zoo).
 If you use any of these models in your work, we are always happy to receive a [citation](#bibtex).
