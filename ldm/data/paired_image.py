@@ -81,7 +81,10 @@ class PairedImageDataset(Dataset):
         image = self._maybe_resize(image)
         image = self._maybe_flip(image)
         image = np.array(image).astype(np.float32) / 127.5 - 1.0
-        return torch.from_numpy(image).permute(2, 0, 1)
+        tensor = torch.from_numpy(image).permute(2, 0, 1)
+        if tensor.dtype != torch.float32:
+            tensor = tensor.float()
+        return tensor.contiguous()
 
     def _read_image(self, path: Path) -> np.ndarray:
         if path.suffix.lower() == ".npy":
